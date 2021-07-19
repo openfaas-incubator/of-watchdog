@@ -44,6 +44,7 @@ func (f *SerializingForkFunctionRunner) Run(req FunctionRequest, w http.Response
 
 func serializeFunction(req FunctionRequest, f *SerializingForkFunctionRunner) (*[]byte, error) {
 	log.Printf("Running %s", req.Process)
+	defer req.InputReader.Close()
 
 	start := time.Now()
 	cmd := exec.Command(req.Process, req.ProcessArgs...)
@@ -68,30 +69,32 @@ func serializeFunction(req FunctionRequest, f *SerializingForkFunctionRunner) (*
 		defer timer.Stop()
 	}
 
-	var data []byte
-
-	// Read request if present.
-	if req.ContentLength != nil {
-		defer req.InputReader.Close()
-		limitReader := io.LimitReader(req.InputReader, *req.ContentLength)
-		var err error
-		data, err = ioutil.ReadAll(limitReader)
-
-		if err != nil {
-			return nil, err
-		}
-
-	}
-
 	stdout, _ := cmd.StdoutPipe()
 	stdin, _ := cmd.StdinPipe()
+	stderr, _ := cmd.StderrPipe()
 
 	err := cmd.Start()
 	if err != nil {
+		log.Printf("Could not start process %s", err)
 		return nil, err
 	}
 
-	functionRes, errors := pipeToProcess(stdin, stdout, &data)
+	for {
+		n, err := io.CopyN(stdin, req.InputReader, 512)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("Could not copy input stream %s", err)
+			break
+		}
+		if n == 0 {
+			time.Sleep(100 * time.Nanosecond)
+		}
+	}
+	stdin.Close()
+
+	functionRes, functionError, errors := readOutputStreamFromProcess(stdout, stderr)
 
 	if len(errors) > 0 {
 		return nil, errors[0]
@@ -99,7 +102,17 @@ func serializeFunction(req FunctionRequest, f *SerializingForkFunctionRunner) (*
 
 	waitErr := cmd.Wait()
 	if waitErr != nil {
+		if functionError != nil {
+			log.Printf("Stderr %s", string(*functionError))
+		}
 		return nil, err
+	}
+
+	if cmd.ProcessState.ExitCode() != 0 {
+		log.Printf("Function exit with code %d", cmd.ProcessState.ExitCode())
+		if functionError != nil {
+			log.Printf("stderr %s", string(*functionError))
+		}
 	}
 
 	done := time.Since(start)
@@ -108,8 +121,9 @@ func serializeFunction(req FunctionRequest, f *SerializingForkFunctionRunner) (*
 	return functionRes, nil
 }
 
-func pipeToProcess(stdin io.WriteCloser, stdout io.Reader, data *[]byte) (*[]byte, []error) {
+func readOutputStreamFromProcess(stdout io.Reader, stderr io.Reader) (*[]byte, *[]byte, []error) {
 	var functionResult *[]byte
+	var functionError *[]byte
 	var errors []error
 
 	errChannel := make(chan error)
@@ -125,17 +139,6 @@ func pipeToProcess(stdin io.WriteCloser, stdout io.Reader, data *[]byte) (*[]byt
 	wg.Add(2)
 
 	go func(c chan error) {
-		_, err := stdin.Write(*data)
-		stdin.Close()
-
-		if err != nil {
-			c <- err
-		}
-
-		wg.Done()
-	}(errChannel)
-
-	go func(c chan error) {
 		var err error
 		result, err := ioutil.ReadAll(stdout)
 		functionResult = &result
@@ -146,7 +149,18 @@ func pipeToProcess(stdin io.WriteCloser, stdout io.Reader, data *[]byte) (*[]byt
 		wg.Done()
 	}(errChannel)
 
+	go func(c chan error) {
+		var err error
+		result, err := ioutil.ReadAll(stderr)
+		functionError = &result
+		if err != nil {
+			c <- err
+		}
+
+		wg.Done()
+	}(errChannel)
+
 	wg.Wait()
 
-	return functionResult, errors
+	return functionResult, functionError, errors
 }
